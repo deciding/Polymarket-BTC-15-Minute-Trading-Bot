@@ -30,7 +30,6 @@ except ImportError as e:
 
 # Now import Nautilus
 from nautilus_trader.config import (
-    InstrumentProviderConfig,
     LiveDataEngineConfig,
     LiveExecEngineConfig,
     LiveRiskEngineConfig,
@@ -69,6 +68,7 @@ from execution.risk_engine import get_risk_engine
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
 from feedback.learning_engine import get_learning_engine
+from polymarket_node_config import build_polymarket_client_configs
 load_dotenv()
 from patch_market_orders import apply_market_order_patch
 patch_applied = apply_market_order_patch()
@@ -83,7 +83,7 @@ else:
 # =============================================================================
 QUOTE_STABILITY_REQUIRED = 3      # Need only 3 valid ticks to be stable (faster startup)
 QUOTE_MIN_SPREAD = 0.001          # Both bid AND ask must be at least this
-MARKET_INTERVAL_SECONDS = 900     # 15-minute markets
+MARKET_INTERVAL_SECONDS = 300     # 5-minute markets
 
 
 @dataclass
@@ -392,7 +392,7 @@ class IntegratedBTCStrategy(Strategy):
                     question = instrument.info.get('question', '').lower()
                     slug = instrument.info.get('market_slug', '').lower()
                     
-                    if ('btc' in question or 'btc' in slug) and '15m' in slug:
+                    if ('btc' in question or 'btc' in slug) and '5m' in slug:
                         try:
                             timestamp_part = slug.split('-')[-1]
                             market_timestamp = int(timestamp_part)
@@ -400,9 +400,9 @@ class IntegratedBTCStrategy(Strategy):
                             # The slug timestamp IS the market start time (Unix, no offset).
                             # end_date_iso is a DATE-only string (e.g. "2026-02-20"), NOT a datetime,
                             # so parsing it gives midnight UTC which is wrong for intraday markets.
-                            # Always derive end_timestamp from the slug: start + 900s.
+                            # Always derive end_timestamp from the slug: start + 300s.
                             real_start_ts = market_timestamp
-                            end_timestamp = market_timestamp + 900  # 15-min markets always
+                            end_timestamp = market_timestamp + 300  # 5-min markets always
                             time_diff = real_start_ts - current_timestamp
                             
                             # Only include markets that haven't ended yet
@@ -622,7 +622,7 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def on_quote_tick(self, tick: QuoteTick):
-        """Handle quote tick - TRADE when market opens and at each 15-min boundary"""
+        """Handle quote tick - TRADE when market opens and at each 5-min boundary"""
         try:
             # Only process ticks from current instrument
             if self.instrument_id is None or tick.instrument_id != self.instrument_id:
@@ -640,6 +640,12 @@ class IntegratedBTCStrategy(Strategy):
                 ask_decimal = ask.as_decimal()
             except:
                 return
+
+            # Print ongoing quote every 3 seconds
+            if not hasattr(self, '_last_price_print_time') or (now.timestamp() - self._last_price_print_time) >= 3:
+                mid_price = (bid_decimal + ask_decimal) / 2
+                logger.info(f"[PRICE] {now.strftime('%H:%M:%S')} | Bid: ${float(bid_decimal):.4f} | Ask: ${float(ask_decimal):.4f} | Mid: ${float(mid_price):.4f}")
+                self._last_price_print_time = now.timestamp()
 
             # Always store price history
             mid_price = (bid_decimal + ask_decimal) / 2
@@ -693,7 +699,7 @@ class IntegratedBTCStrategy(Strategy):
             current_market = self.all_btc_instruments[self.current_instrument_index]
             market_start_ts = current_market['market_timestamp']  # Slug timestamp = market start (Unix)
 
-            # How many 15-min intervals have elapsed since this market opened?
+            # How many 5-min intervals have elapsed since this market opened?
             elapsed_secs = now.timestamp() - market_start_ts
             if elapsed_secs < 0:
                 # Market hasn't started yet — block
@@ -705,10 +711,10 @@ class IntegratedBTCStrategy(Strategy):
             trade_key = (market_start_ts, sub_interval)
 
             # =========================================================================
-            # TRADE WINDOW: minutes 13–14 of each 15-min market (780–840 seconds in)
+            # TRADE WINDOW: minutes 3–4 of each 5-min market (180–240 seconds in)
             #
             # WHY LATE IN THE MARKET:
-            #   At 13 minutes in, the UP/DOWN result is nearly decided. The price IS
+            #   At 3-4 minutes in, the UP/DOWN result is nearly decided. The price IS
             #   the trend — if YES is at $0.78, BTC went up during this interval.
             #   We're not predicting anymore, we're reading a nearly-resolved outcome.
             #
@@ -727,8 +733,8 @@ class IntegratedBTCStrategy(Strategy):
             #   2.0+ shares = price $0.50 → pure coin flip, SKIP
             # =========================================================================
             seconds_into_sub_interval = elapsed_secs % MARKET_INTERVAL_SECONDS
-            TRADE_WINDOW_START = 780   # 13 minutes in
-            TRADE_WINDOW_END   = 840   # 14 minutes in (60s window)
+            TRADE_WINDOW_START = 180   # 3 minutes in
+            TRADE_WINDOW_END   = 240   # 4 minutes in (60s window)
 
             if TRADE_WINDOW_START <= seconds_into_sub_interval < TRADE_WINDOW_END and trade_key != self.last_trade_time:
                 self.last_trade_time = trade_key
@@ -1338,57 +1344,27 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     
     # =========================================================================
     # Slug timestamps ARE standard Unix timestamps (no offset) aligned to
-    # 15-min boundaries. Generate slugs for current + next 24 hours.
+    # 5-min boundaries. Generate slugs for current + next 24 hours.
     # =========================================================================
     now = datetime.now(timezone.utc)
-    unix_interval_start = (int(now.timestamp()) // 900) * 900  # current 15-min boundary
+    unix_interval_start = (int(now.timestamp()) // 300) * 300  # current 5-min boundary
 
     btc_slugs = []
     for i in range(-1, 97):  # include 1 prior interval (in case we're just after boundary)
-        timestamp = unix_interval_start + (i * 900)
-        btc_slugs.append(f"btc-updown-15m-{timestamp}")
-
-    filters = {
-        "active": True,
-        "closed": False,
-        "archived": False,
-        "slug": tuple(btc_slugs),
-        "limit": 100,
-    }
+        timestamp = unix_interval_start + (i * 300)
+        btc_slugs.append(f"btc-updown-5m-{timestamp}")
 
     logger.info("=" * 80)
-    logger.info("LOADING BTC 15-MIN MARKETS BY SLUG")
+    logger.info("LOADING BTC 5-MIN MARKETS BY SLUG")
     logger.info(f"  Interval start: {unix_interval_start} | Count: {len(btc_slugs)}")
     logger.info(f"  First: {btc_slugs[0]}  Last: {btc_slugs[-1]}")
     logger.info("=" * 80)
 
-    instrument_cfg = InstrumentProviderConfig(
-        load_all=True,
-        filters=filters,
-        use_gamma_markets=True,
-    )
-
-    poly_data_cfg = PolymarketDataClientConfig(
-        private_key=os.getenv("POLYMARKET_PK"),
-        api_key=os.getenv("POLYMARKET_API_KEY"),
-        api_secret=os.getenv("POLYMARKET_API_SECRET"),
-        passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-        signature_type=0,
-        instrument_provider=instrument_cfg,
-    )
-
-    poly_exec_cfg = PolymarketExecClientConfig(
-        private_key=os.getenv("POLYMARKET_PK"),
-        api_key=os.getenv("POLYMARKET_API_KEY"),
-        api_secret=os.getenv("POLYMARKET_API_SECRET"),
-        passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-        signature_type=0,
-        instrument_provider=instrument_cfg,
-    )
+    _, poly_data_cfg, poly_exec_cfg = build_polymarket_client_configs(btc_slugs, signature_type=0)
 
     config = TradingNodeConfig(
         environment="live",
-        trader_id="BTC-15MIN-INTEGRATED-001",
+        trader_id="BTC-5MIN-INTEGRATED-001",
         logging=LoggingConfig(
             log_level="INFO",
             log_directory="./logs/nautilus",
