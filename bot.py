@@ -85,6 +85,15 @@ QUOTE_STABILITY_REQUIRED = 3      # Need only 3 valid ticks to be stable (faster
 QUOTE_MIN_SPREAD = 0.001          # Both bid and ask must be at least this
 DEFAULT_MARKET_INTERVAL = 300     # 5-minute markets (use --interval to change to 15min=900)
 
+# Strategy thresholds from environment
+def get_strategy_thresholds():
+    return {
+        "trade_window_start_pct": float(os.getenv("TRADE_WINDOW_START_PCT", "0.6")),
+        "trade_window_end_pct": float(os.getenv("TRADE_WINDOW_END_PCT", "0.8")),
+        "trend_up_threshold": float(os.getenv("TREND_UP_THRESHOLD", "0.60")),
+        "trend_down_threshold": float(os.getenv("TREND_DOWN_THRESHOLD", "0.40")),
+    }
+
 
 @dataclass
 class PaperTrade:
@@ -106,6 +115,39 @@ class PaperTrade:
             'signal_score': self.signal_score,
             'signal_confidence': self.signal_confidence,
             'outcome': self.outcome,
+        }
+
+
+@dataclass
+class RealtimePaperPosition:
+    """Track real-time paper trades with actual shares and P&L calculation"""
+    entry_time: datetime
+    direction: str          # "long" (bought UP/YES) or "short" (bought DOWN/NO)
+    entry_price: float     # Price when entered (e.g., 0.72)
+    usd_spent: float       # How much USD spent (e.g., 1.00)
+    shares: float         # Number of shares bought (usd_spent / entry_price)
+    market_slug: str      # Which market
+    market_end_time: datetime  # When market closes
+    
+    def calculate_pnl(self, exit_price: float) -> float:
+        """Calculate P&L based on exit price"""
+        if self.direction == "long":
+            # Bought UP/YES, profit if price goes up
+            pnl = (exit_price - self.entry_price) * self.shares
+        else:
+            # Bought DOWN/NO, profit if price goes down
+            pnl = (self.entry_price - exit_price) * self.shares
+        return pnl
+    
+    def to_dict(self):
+        return {
+            'entry_time': self.entry_time.isoformat(),
+            'direction': self.direction,
+            'entry_price': self.entry_price,
+            'usd_spent': self.usd_spent,
+            'shares': self.shares,
+            'market_slug': self.market_slug,
+            'market_end_time': self.market_end_time.isoformat(),
         }
 
 
@@ -137,10 +179,19 @@ class IntegratedBTCStrategy(Strategy):
     - Correct timing for market switching
     """
 
-    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False, market_interval: int = DEFAULT_MARKET_INTERVAL):
+    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False, market_interval: int = DEFAULT_MARKET_INTERVAL, thresholds: dict = None):
         super().__init__()
 
         self.market_interval = market_interval
+        
+        # Load thresholds from env or use defaults
+        if thresholds is None:
+            thresholds = get_strategy_thresholds()
+        self.trade_window_start_pct = thresholds["trade_window_start_pct"]
+        self.trade_window_end_pct = thresholds["trade_window_end_pct"]
+        self.trend_up_threshold = thresholds["trend_up_threshold"]
+        self.trend_down_threshold = thresholds["trend_down_threshold"]
+        
         self.bot_start_time = datetime.now(timezone.utc)
         self.restart_after_minutes = 90
 
@@ -231,6 +282,14 @@ class IntegratedBTCStrategy(Strategy):
 
         # Paper trading tracker
         self.paper_trades: List[PaperTrade] = []
+        
+        # Realtime paper positions (enhanced tracking)
+        # Cumulative shares for UP and DOWN (accumulated per market)
+        self.up_shares: float = 0.0
+        self.up_usd_spent: float = 0.0
+        self.down_shares: float = 0.0
+        self.down_usd_spent: float = 0.0
+        self.current_market_slug: str = ""
 
         self.test_mode = test_mode
 
@@ -563,6 +622,16 @@ class IntegratedBTCStrategy(Strategy):
         self.last_trade_time = -1
         logger.info(f"  Trade timer reset — will trade on next tick")
         
+        # Close any open realtime paper positions - just print accumulated shares
+        if self.up_shares > 0 or self.down_shares > 0:
+            self._close_realtime_position()
+            # Reset for next market
+            self.up_shares = 0.0
+            self.up_usd_spent = 0.0
+            self.down_shares = 0.0
+            self.down_usd_spent = 0.0
+            self.current_market_slug = ""
+        
         self.subscribe_quote_ticks(self.instrument_id)
         return True
 
@@ -735,9 +804,9 @@ class IntegratedBTCStrategy(Strategy):
             #   2.0+ shares = price $0.50 → pure coin flip, SKIP
             # =========================================================================
             seconds_into_sub_interval = elapsed_secs % self.market_interval
-            # Trade window: 60-80% of interval (late in the market)
-            TRADE_WINDOW_START = int(self.market_interval * 0.6)
-            TRADE_WINDOW_END   = int(self.market_interval * 0.8)
+            # Trade window: configurable % of interval (from .env)
+            TRADE_WINDOW_START = int(self.market_interval * self.trade_window_start_pct)
+            TRADE_WINDOW_END   = int(self.market_interval * self.trade_window_end_pct)
 
             if TRADE_WINDOW_START <= seconds_into_sub_interval < TRADE_WINDOW_END and trade_key != self.last_trade_time:
                 self.last_trade_time = trade_key
@@ -760,15 +829,15 @@ class IntegratedBTCStrategy(Strategy):
     # Trading decision (unchanged)
     # ------------------------------------------------------------------
 
-    def _make_trading_decision_sync(self, current_price):
-        from decimal import Decimal
-        price_decimal = Decimal(str(current_price))
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._make_trading_decision(price_decimal))
-        finally:
-            loop.close()
+    #def _make_trading_decision_sync(self, current_price):
+    #    from decimal import Decimal
+    #    price_decimal = Decimal(str(current_price))
+    #    loop = asyncio.new_event_loop()
+    #    asyncio.set_event_loop(loop)
+    #    try:
+    #        loop.run_until_complete(self._make_trading_decision(price_decimal))
+    #    finally:
+    #        loop.close()
     
     def _make_trading_decision_sync(self, current_price):
         """Synchronous wrapper for trading decision (called from executor)."""
@@ -926,27 +995,25 @@ class IntegratedBTCStrategy(Strategy):
         # (price near $0.50) almost always lose, while trades at 1.4 shares
         # (price ~$0.71) mostly win.
         # =========================================================================
-        TREND_UP_THRESHOLD   = 0.60   # price above this → buy YES (UP)
-        TREND_DOWN_THRESHOLD = 0.40   # price below this → buy NO (DOWN)
-
+        # Use configurable thresholds from .env
         price_float = float(current_price)
 
-        if price_float > TREND_UP_THRESHOLD:
+        if price_float > self.trend_up_threshold:
             direction = "long"
             trend_confidence = price_float  # e.g. 0.72 = 72% confident UP
             logger.info(
-                f" TREND: UP ({price_float:.2%} YES probability) → buying YES"
+                f" TREND: UP ({price_float:.2%} YES probability) → buying YES (threshold: {self.trend_up_threshold:.2f})"
             )
-        elif price_float < TREND_DOWN_THRESHOLD:
+        elif price_float < self.trend_down_threshold:
             direction = "short"
             trend_confidence = 1.0 - price_float  # e.g. 0.31 price = 69% confident DOWN
             logger.info(
-                f" TREND: DOWN ({price_float:.2%} YES probability = {1-price_float:.2%} NO) → buying NO"
+                f" TREND: DOWN ({price_float:.2%} YES probability = {1-price_float:.2%} NO) → buying NO (threshold: {self.trend_down_threshold:.2f})"
             )
         else:
             logger.info(
-                f"⏭ TREND: NEUTRAL ({price_float:.2%}) — price too close to 0.50, SKIPPING trade "
-                f"(coin flip territory: {TREND_DOWN_THRESHOLD:.0%}–{TREND_UP_THRESHOLD:.0%})"
+                f"⏭ TREND: NEUTRAL ({price_float:.2%}) — price in uncertain zone, SKIPPING trade "
+                f"(threshold zone: {self.trend_down_threshold:.0%}–{self.trend_up_threshold:.0%})"
             )
             return
 
@@ -985,7 +1052,10 @@ class IntegratedBTCStrategy(Strategy):
 
         # --- Phase 5 / 6: Execute ---
         if is_simulation:
-            await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
+            # Call both: original for compatibility + new realtime tracking
+            #await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
+            # New realtime tracking
+            await self._realtime_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
         else:
             await self._place_real_order(fused, POSITION_SIZE_USD, current_price, direction)
             
@@ -1051,6 +1121,94 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
 
         self._save_paper_trades()
+
+    # ------------------------------------------------------------------
+    # Realtime Paper Trading (Enhanced)
+    # ------------------------------------------------------------------
+
+    async def _realtime_paper_trade(self, signal, position_size, current_price, direction):
+        """Record real-time paper trade with accumulated UP/DOWN shares"""
+        price_float = float(current_price)
+        usd_spent = float(position_size)
+        
+        # Calculate actual shares bought: shares = USD / price
+        shares = usd_spent / price_float
+        
+        # Determine market info
+        if self.current_instrument_index >= 0 and self.current_instrument_index < len(self.all_btc_instruments):
+            current_market = self.all_btc_instruments[self.current_instrument_index]
+            market_slug = current_market.get('slug', 'unknown')
+            market_end = current_market.get('end_time', datetime.now(timezone.utc))
+        else:
+            market_slug = "unknown"
+            market_end = datetime.now(timezone.utc) + timedelta(seconds=self.market_interval)
+        
+        # Check if new market - reset accumulators
+        if market_slug != self.current_market_slug:
+            logger.info(f"[REALTIME PAPER] New market detected: {market_slug}, resetting accumulators")
+            self.up_shares = 0.0
+            self.up_usd_spent = 0.0
+            self.down_shares = 0.0
+            self.down_usd_spent = 0.0
+            self.current_market_slug = market_slug
+        
+        # Accumulate shares based on direction
+        if direction == "long":
+            # Bought UP (YES)
+            self.up_shares += shares
+            self.up_usd_spent += usd_spent
+            side_label = "UP (YES)"
+        else:
+            # Bought DOWN (NO)
+            self.down_shares += shares
+            self.down_usd_spent += usd_spent
+            side_label = "DOWN (NO)"
+        
+        # Print immediate entry log
+        logger.info("=" * 80)
+        logger.info("[REALTIME PAPER] TRADE OPENED")
+        logger.info(f"  Direction: {side_label}")
+        logger.info(f"  This trade: ${price_float:.4f} @ {shares:.4f} shares (${usd_spent:.2f})")
+        logger.info(f"  Market: {market_slug}")
+        logger.info(f"  Market Ends: {market_end.strftime('%H:%M:%S')}")
+        logger.info("")
+        logger.info(f"  [ACCUMULATED POSITION]")
+        logger.info(f"    UP:   {self.up_shares:.4f} shares | ${self.up_usd_spent:.2f} spent")
+        logger.info(f"    DOWN: {self.down_shares:.4f} shares | ${self.down_usd_spent:.2f} spent")
+        total_spent = self.up_usd_spent + self.down_usd_spent
+        logger.info(f"    TOTAL: ${total_spent:.2f} spent")
+        logger.info("=" * 80)
+        
+        # Also call original for compatibility
+        await self._record_paper_trade(signal, position_size, current_price, direction)
+
+    def _close_realtime_position(self):
+        """Close accumulated realtime positions - just print shares and spent"""
+        if self.current_market_slug == "":
+            return
+        
+        logger.info("=" * 80)
+        logger.info("[REALTIME PAPER] MARKET CLOSED - FINAL POSITION")
+        logger.info(f"  Market: {self.current_market_slug}")
+        logger.info(f"  UP shares: {self.up_shares:.4f} | USD spent: ${self.up_usd_spent:.2f}")
+        logger.info(f"  DOWN shares: {self.down_shares:.4f} | USD spent: ${self.down_usd_spent:.2f}")
+        logger.info("")
+        
+        total_spent = self.up_usd_spent + self.down_usd_spent
+        logger.info(f"  Total USD spent: ${total_spent:.2f}")
+        
+        # Determine which direction bet
+        if self.up_shares > self.down_shares:
+            logger.info(f"  Direction bet: UP (more UP shares)")
+        elif self.down_shares > self.up_shares:
+            logger.info(f"  Direction bet: DOWN (more DOWN shares)")
+        else:
+            logger.info(f"  Direction bet: EQUAL")
+        
+        logger.info("=" * 80)
+        
+        # Clear current position
+        self.current_realtime_position = None
 
     def _save_paper_trades(self):
         import json
@@ -1121,7 +1279,7 @@ class IntegratedBTCStrategy(Strategy):
 
             qty = Quantity(token_qty, precision=precision)
             timestamp_ms = int(time.time() * 1000)
-            unique_id = f"BTC-15MIN-${max_usd_amount:.0f}-{timestamp_ms}"
+            unique_id = f"BTC-XMIN-${max_usd_amount:.0f}-{timestamp_ms}"
 
             order = self.order_factory.market(
                 instrument_id=trade_instrument_id,
@@ -1339,12 +1497,15 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
             logger.warning(f"Could not set Redis simulation mode: {e}")
 
     print(f"\nConfiguration:")
+    thresholds = get_strategy_thresholds()
     print(f"  Initial Mode: {'SIMULATION' if simulation else 'LIVE TRADING'}")
     print(f"  Redis Control: {'Enabled' if redis_client else 'Disabled'}")
     print(f"  Grafana: {'Enabled' if enable_grafana else 'Disabled'}")
     print(f"  Max Trade Size: ${os.getenv('MARKET_BUY_USD', '1.00')}")
     print(f"  Quote stability gate: {QUOTE_STABILITY_REQUIRED} valid ticks")
     print(f"  Market Interval: {interval_min} minutes")
+    print(f"  Trade Window: {int(thresholds['trade_window_start_pct']*100)}%-{int(thresholds['trade_window_end_pct']*100)}% of interval")
+    print(f"  Price Thresholds: UP>{thresholds['trend_up_threshold']:.2f} | DOWN<{thresholds['trend_down_threshold']:.2f}")
     print()
 
     now = datetime.now(timezone.utc)
@@ -1388,6 +1549,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         enable_grafana=enable_grafana,
         test_mode=test_mode,
         market_interval=market_interval,
+        thresholds=get_strategy_thresholds(),
     )
 
     print("\nBuilding Nautilus node...")
