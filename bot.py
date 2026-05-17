@@ -430,6 +430,9 @@ class IntegratedBTCStrategy(Strategy):
         self.last_down_shares: float = 0.0
         self.last_down_usd: float = 0.0
         self.last_market_price: float = None
+        self.market_tape_path: str = "market_tape.jsonl"
+        self.current_market_tape: Dict = {}
+        self.last_market_tape: Dict = {}
 
         self.test_mode = test_mode
 
@@ -771,6 +774,7 @@ class IntegratedBTCStrategy(Strategy):
             self.last_down_usd = self.down_usd_spent
             # Save last price for fallback resolution
             self.last_market_price = float(self.price_history[-1]) if self.price_history else None
+            self.last_market_tape = self.current_market_tape.copy() if self.current_market_tape else {}
             
             # Reset for next market
             self.up_shares = 0.0
@@ -778,6 +782,7 @@ class IntegratedBTCStrategy(Strategy):
             self.down_shares = 0.0
             self.down_usd_spent = 0.0
             self.current_market_slug = ""
+            self.current_market_tape = {}
         
         # Switch to new market first
         self.subscribe_quote_ticks(self.instrument_id)
@@ -869,6 +874,12 @@ class IntegratedBTCStrategy(Strategy):
                 mid_price = (bid_decimal + ask_decimal) / 2
                 logger.info(f"[PRICE] {now.strftime('%H:%M:%S')} | Bid: ${float(bid_decimal):.4f} | Ask: ${float(ask_decimal):.4f} | Mid: ${float(mid_price):.4f}")
                 self._last_price_print_time = now.timestamp()
+                if self.current_market_tape:
+                    self.current_market_tape.setdefault("quotes", []).append({
+                        "ts": now.isoformat(),
+                        "bid": float(bid_decimal),
+                        "ask": float(ask_decimal),
+                    })
 
             # Always store price history
             mid_price = (bid_decimal + ask_decimal) / 2
@@ -1292,9 +1303,11 @@ class IntegratedBTCStrategy(Strategy):
         if self.current_instrument_index >= 0 and self.current_instrument_index < len(self.all_btc_instruments):
             current_market = self.all_btc_instruments[self.current_instrument_index]
             market_slug = current_market.get('slug', 'unknown')
+            market_start = current_market.get('start_time', datetime.now(timezone.utc))
             market_end = current_market.get('end_time', datetime.now(timezone.utc))
         else:
             market_slug = "unknown"
+            market_start = datetime.now(timezone.utc)
             market_end = datetime.now(timezone.utc) + timedelta(seconds=self.market_interval)
         
         # Check if new market - reset accumulators
@@ -1305,6 +1318,11 @@ class IntegratedBTCStrategy(Strategy):
             self.down_shares = 0.0
             self.down_usd_spent = 0.0
             self.current_market_slug = market_slug
+            self.current_market_tape = {
+                "market_slug": market_slug,
+                "market_start_time": market_start.isoformat(),
+                "quotes": [],
+            }
         
         # Accumulate shares based on direction
         if direction == "long":
@@ -1414,6 +1432,11 @@ class IntegratedBTCStrategy(Strategy):
         up_usd = self.last_up_usd
         down_shares = self.last_down_shares
         down_usd = self.last_down_usd
+        market_tape = self.last_market_tape.copy() if self.last_market_tape else {
+            "market_slug": market_slug,
+            "market_start_time": None,
+            "quotes": [],
+        }
         
         logger.info("=" * 80)
         logger.info("[REALTIME PAPER] CHECKING PREVIOUS MARKET RESOLUTION")
@@ -1442,6 +1465,7 @@ class IntegratedBTCStrategy(Strategy):
         
         logger.info(f"  Market winner: {winner}")
         logger.info("=" * 80)
+        market_tape["winner"] = winner
         
         # Write to log
         logger.info(f"  Writing to close_market.log...")
@@ -1456,9 +1480,18 @@ class IntegratedBTCStrategy(Strategy):
             logger.info("  Log written successfully")
         except Exception as e:
             logger.warning(f"Failed to write close_market.log: {e}")
+
+        try:
+            with open(self.market_tape_path, 'a') as f:
+                f.write(json.dumps(market_tape) + "\n")
+                f.flush()
+            logger.info(f"  Market tape written to {self.market_tape_path}")
+        except Exception as e:
+            logger.warning(f"Failed to write market tape: {e}")
         
         # Clear last market info
         self.last_market_slug = ""
+        self.last_market_tape = {}
 
     def _save_paper_trades(self):
         import json
