@@ -1373,7 +1373,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         api_key=os.getenv("POLYMARKET_API_KEY"),
         api_secret=os.getenv("POLYMARKET_API_SECRET"),
         passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-        signature_type=1,
+        signature_type=0,
         instrument_provider=instrument_cfg,
     )
 
@@ -1382,7 +1382,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         api_key=os.getenv("POLYMARKET_API_KEY"),
         api_secret=os.getenv("POLYMARKET_API_SECRET"),
         passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-        signature_type=1,
+        signature_type=0,
         instrument_provider=instrument_cfg,
     )
 
