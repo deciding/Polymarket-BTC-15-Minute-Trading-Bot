@@ -82,8 +82,8 @@ else:
 # CONSTANTS
 # =============================================================================
 QUOTE_STABILITY_REQUIRED = 3      # Need only 3 valid ticks to be stable (faster startup)
-QUOTE_MIN_SPREAD = 0.001          # Both bid AND ask must be at least this
-MARKET_INTERVAL_SECONDS = 300     # 5-minute markets
+QUOTE_MIN_SPREAD = 0.001          # Both bid and ask must be at least this
+DEFAULT_MARKET_INTERVAL = 300     # 5-minute markets (use --interval to change to 15min=900)
 
 
 @dataclass
@@ -137,9 +137,10 @@ class IntegratedBTCStrategy(Strategy):
     - Correct timing for market switching
     """
 
-    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False):
+    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False, market_interval: int = DEFAULT_MARKET_INTERVAL):
         super().__init__()
 
+        self.market_interval = market_interval
         self.bot_start_time = datetime.now(timezone.utc)
         self.restart_after_minutes = 90
 
@@ -254,7 +255,7 @@ class IntegratedBTCStrategy(Strategy):
     def _seconds_to_next_15min_boundary(self) -> float:
         """Return seconds until the next 15-minute UTC boundary."""
         now_ts = datetime.now(timezone.utc).timestamp()
-        next_boundary = (math.floor(now_ts / MARKET_INTERVAL_SECONDS) + 1) * MARKET_INTERVAL_SECONDS
+        next_boundary = (math.floor(now_ts / self.market_interval) + 1) * self.market_interval
         return next_boundary - now_ts
 
     def _is_quote_valid(self, bid, ask) -> bool:
@@ -386,13 +387,14 @@ class IntegratedBTCStrategy(Strategy):
         
         btc_instruments = []
         
+        interval_suffix = f"{self.market_interval // 60}m"
         for instrument in instruments:
             try:
                 if hasattr(instrument, 'info') and instrument.info:
                     question = instrument.info.get('question', '').lower()
                     slug = instrument.info.get('market_slug', '').lower()
                     
-                    if ('btc' in question or 'btc' in slug) and '5m' in slug:
+                    if ('btc' in question or 'btc' in slug) and interval_suffix in slug:
                         try:
                             timestamp_part = slug.split('-')[-1]
                             market_timestamp = int(timestamp_part)
@@ -400,9 +402,9 @@ class IntegratedBTCStrategy(Strategy):
                             # The slug timestamp IS the market start time (Unix, no offset).
                             # end_date_iso is a DATE-only string (e.g. "2026-02-20"), NOT a datetime,
                             # so parsing it gives midnight UTC which is wrong for intraday markets.
-                            # Always derive end_timestamp from the slug: start + 300s.
+                            # Always derive end_timestamp from the slug: start + interval.
                             real_start_ts = market_timestamp
-                            end_timestamp = market_timestamp + 300  # 5-min markets always
+                            end_timestamp = market_timestamp + self.market_interval
                             time_diff = real_start_ts - current_timestamp
                             
                             # Only include markets that haven't ended yet
@@ -705,7 +707,7 @@ class IntegratedBTCStrategy(Strategy):
                 # Market hasn't started yet — block
                 return
 
-            sub_interval = int(elapsed_secs // MARKET_INTERVAL_SECONDS)
+            sub_interval = int(elapsed_secs // self.market_interval)
 
             # Unique trade key: (market_start_timestamp, sub_interval)
             trade_key = (market_start_ts, sub_interval)
@@ -732,9 +734,10 @@ class IntegratedBTCStrategy(Strategy):
             #   1.9 shares = price $0.53 → weak trend, near coin flip
             #   2.0+ shares = price $0.50 → pure coin flip, SKIP
             # =========================================================================
-            seconds_into_sub_interval = elapsed_secs % MARKET_INTERVAL_SECONDS
-            TRADE_WINDOW_START = 180   # 3 minutes in
-            TRADE_WINDOW_END   = 240   # 4 minutes in (60s window)
+            seconds_into_sub_interval = elapsed_secs % self.market_interval
+            # Trade window: 60-80% of interval (late in the market)
+            TRADE_WINDOW_START = int(self.market_interval * 0.6)
+            TRADE_WINDOW_END   = int(self.market_interval * 0.8)
 
             if TRADE_WINDOW_START <= seconds_into_sub_interval < TRADE_WINDOW_END and trade_key != self.last_trade_time:
                 self.last_trade_time = trade_key
@@ -1310,11 +1313,14 @@ class IntegratedBTCStrategy(Strategy):
 # Runner
 # ---------------------------------------------------------------------------
 
-def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, test_mode: bool = False):
-    """Run the integrated BTC 15-min trading bot - LOADS ALL BTC MARKETS FOR THE DAY"""
+def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, test_mode: bool = False, market_interval: int = DEFAULT_MARKET_INTERVAL):
+    """Run the integrated BTC trading bot - LOADS ALL BTC MARKETS FOR THE DAY"""
+    
+    interval_min = market_interval // 60
+    interval_label = f"{interval_min}-MIN"
     
     print("=" * 80)
-    print("INTEGRATED POLYMARKET BTC 15-MIN TRADING BOT")
+    print(f"INTEGRATED POLYMARKET BTC {interval_label} TRADING BOT")
     print("Nautilus + 7-Phase System + Redis Control")
     print("=" * 80)
 
@@ -1338,24 +1344,25 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     print(f"  Grafana: {'Enabled' if enable_grafana else 'Disabled'}")
     print(f"  Max Trade Size: ${os.getenv('MARKET_BUY_USD', '1.00')}")
     print(f"  Quote stability gate: {QUOTE_STABILITY_REQUIRED} valid ticks")
+    print(f"  Market Interval: {interval_min} minutes")
     print()
 
     now = datetime.now(timezone.utc)
     
     # =========================================================================
     # Slug timestamps ARE standard Unix timestamps (no offset) aligned to
-    # 5-min boundaries. Generate slugs for current + next 24 hours.
+    # configurable boundaries. Generate slugs for current + next 24 hours.
     # =========================================================================
     now = datetime.now(timezone.utc)
-    unix_interval_start = (int(now.timestamp()) // 300) * 300  # current 5-min boundary
+    unix_interval_start = (int(now.timestamp()) // market_interval) * market_interval
 
     btc_slugs = []
     for i in range(-1, 97):  # include 1 prior interval (in case we're just after boundary)
-        timestamp = unix_interval_start + (i * 300)
-        btc_slugs.append(f"btc-updown-5m-{timestamp}")
+        timestamp = unix_interval_start + (i * market_interval)
+        btc_slugs.append(f"btc-updown-{interval_min}m-{timestamp}")
 
     logger.info("=" * 80)
-    logger.info("LOADING BTC 5-MIN MARKETS BY SLUG")
+    logger.info(f"LOADING BTC {interval_min}-MIN MARKETS BY SLUG")
     logger.info(f"  Interval start: {unix_interval_start} | Count: {len(btc_slugs)}")
     logger.info(f"  First: {btc_slugs[0]}  Last: {btc_slugs[-1]}")
     logger.info("=" * 80)
@@ -1364,7 +1371,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
 
     config = TradingNodeConfig(
         environment="live",
-        trader_id="BTC-5MIN-INTEGRATED-001",
+        trader_id=f"BTC-{interval_label}-INTEGRATED-001",
         logging=LoggingConfig(
             log_level="INFO",
             log_directory="./logs/nautilus",
@@ -1380,6 +1387,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         redis_client=redis_client,
         enable_grafana=enable_grafana,
         test_mode=test_mode,
+        market_interval=market_interval,
     )
 
     print("\nBuilding Nautilus node...")
@@ -1406,16 +1414,23 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Integrated BTC 15-Min Trading Bot")
+    parser = argparse.ArgumentParser(description="Integrated BTC Trading Bot")
     parser.add_argument("--live", action="store_true",
                         help="Run in LIVE mode (real money at risk!). Default is simulation.")
     parser.add_argument("--no-grafana", action="store_true", help="Disable Grafana metrics")
     parser.add_argument("--test-mode", action="store_true",
                         help="Run in TEST MODE (trade every minute for faster testing)")
+    parser.add_argument("--interval", type=int, default=DEFAULT_MARKET_INTERVAL,
+                        help=f"Market interval in seconds (default: {DEFAULT_MARKET_INTERVAL}, use 900 for 15-min)")
 
     args = parser.parse_args()
     enable_grafana = not args.no_grafana
     test_mode = args.test_mode
+    market_interval = args.interval
+
+    # Validate interval
+    if market_interval not in (300, 900):
+        logger.warning(f"Unusual interval {market_interval}s, supported values: 300 (5min), 900 (15min)")
 
     # --test-mode ALWAYS forces simulation even if --live is also passed
     if args.test_mode:
@@ -1433,7 +1448,7 @@ def main():
         logger.info("No real orders will be placed.")
         logger.info("=" * 80)
 
-    run_integrated_bot(simulation=simulation, enable_grafana=enable_grafana, test_mode=test_mode)
+    run_integrated_bot(simulation=simulation, enable_grafana=enable_grafana, test_mode=test_mode, market_interval=market_interval)
 
 
 if __name__ == "__main__":
