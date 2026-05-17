@@ -56,6 +56,58 @@ from dotenv import load_dotenv
 from loguru import logger
 import redis
 
+
+
+
+def get_market_winner_sync(market_slug: str) -> str:
+    """Query Polymarket API to get the winning outcome using REST API."""
+    import requests
+    try:
+        # Use REST API endpoint
+        response = requests.get(
+            f"https://clob.polymarket.com/markets/{market_slug}",
+            timeout=10
+        )
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Check for resolution
+            resolution = data.get("resolution")
+            if resolution:
+                return resolution.upper()
+            
+            # Check outcome prices - winner has price = 1.0 or > 0.5
+            outcomes = data.get("outcomes", [])
+            if not outcomes:
+                # Try alternative field
+                outcome_prices = data.get("outcomePrices", "[]")
+                if outcome_prices:
+                    try:
+                        import json
+                        prices = json.loads(outcome_prices)
+                        if prices:
+                            # First outcome is YES (UP), second is NO (DOWN)
+                            if float(prices[0]) >= 0.5:
+                                return "YES"
+                            elif float(prices[1]) >= 0.5:
+                                return "NO"
+                    except:
+                        pass
+            
+            # Check tokens field
+            tokens = data.get("tokens", [])
+            for token in tokens:
+                if token.get("outcome") == "Yes" and float(token.get("price", 0)) >= 0.5:
+                    return "YES"
+                if token.get("outcome") == "No" and float(token.get("price", 0)) >= 0.5:
+                    return "NO"
+                    
+        return "UNKNOWN"
+    except Exception as e:
+        logger.warning(f"Could not fetch market winner for {market_slug}: {e}")
+        return "UNKNOWN"
+
+
 # Import our phases
 from core.strategy_brain.signal_processors.spike_detector import SpikeDetectionProcessor
 from core.strategy_brain.signal_processors.sentiment_processor import SentimentProcessor
@@ -290,6 +342,7 @@ class IntegratedBTCStrategy(Strategy):
         self.down_shares: float = 0.0
         self.down_usd_spent: float = 0.0
         self.current_market_slug: str = ""
+        self.last_traded_direction: str = ""
 
         self.test_mode = test_mode
 
@@ -622,7 +675,7 @@ class IntegratedBTCStrategy(Strategy):
         self.last_trade_time = -1
         logger.info(f"  Trade timer reset — will trade on next tick")
         
-        # Close any open realtime paper positions - just print accumulated shares
+        # Close any open realtime paper positions - print with resolution
         if self.up_shares > 0 or self.down_shares > 0:
             self._close_realtime_position()
             # Reset for next market
@@ -1160,11 +1213,14 @@ class IntegratedBTCStrategy(Strategy):
             self.up_shares += shares
             self.up_usd_spent += usd_spent
             side_label = "UP (YES)"
+            self.last_traded_direction = "UP"
         else:
             # Bought DOWN (NO)
             self.down_shares += shares
-            self.down_usd_spent += (1 - usd_spent)
+            usd_spent = 1 - usd_spent
+            self.down_usd_spent += usd_spent
             side_label = "DOWN (NO)"
+            self.last_traded_direction = "DOWN"
         
         # Print immediate entry log
         logger.info("=" * 80)
@@ -1185,7 +1241,7 @@ class IntegratedBTCStrategy(Strategy):
         #await self._record_paper_trade(signal, position_size, current_price, direction)
 
     def _close_realtime_position(self):
-        """Close accumulated realtime positions - just print shares and spent"""
+        """Close accumulated realtime positions - with resolution"""
         if self.current_market_slug == "":
             return
         
@@ -1207,7 +1263,31 @@ class IntegratedBTCStrategy(Strategy):
         else:
             logger.info(f"  Direction bet: EQUAL")
         
+        # Query Polymarket for actual winner
+        winner = get_market_winner_sync(self.current_market_slug)
+        logger.info("")
+        logger.info(f"  Market winner: {winner}")
+        
+        if winner == "YES":
+            logger.info(f"  Actual outcome: UP WON")
+        elif winner == "NO":
+            logger.info(f"  Actual outcome: DOWN WON")
+        else:
+            logger.info(f"  Actual outcome: {winner} (not resolved yet)")
+        
         logger.info("=" * 80)
+        
+        # Write to close_market.log with flush
+        try:
+            with open('close_market.log', 'a') as f:
+                f.write(f"[{datetime.now(timezone.utc).isoformat()}] Market: {self.current_market_slug}\n")
+                f.write(f"  UP: {self.up_shares:.4f} shares | ${self.up_usd_spent:.2f}\n")
+                f.write(f"  DOWN: {self.down_shares:.4f} shares | ${self.down_usd_spent:.2f}\n")
+                f.write(f"  Winner: {winner}\n")
+                f.write("\n")
+                f.flush()
+        except Exception as e:
+            logger.warning(f"Failed to write close_market.log: {e}")
         
         # Clear current position
         self.current_realtime_position = None
