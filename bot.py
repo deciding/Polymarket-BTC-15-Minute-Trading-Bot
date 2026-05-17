@@ -224,6 +224,7 @@ def get_strategy_thresholds():
         "trade_window_end_pct": float(os.getenv("TRADE_WINDOW_END_PCT", "0.8")),
         "trend_up_threshold": float(os.getenv("TREND_UP_THRESHOLD", "0.60")),
         "trend_down_threshold": float(os.getenv("TREND_DOWN_THRESHOLD", "0.40")),
+        "enable_signals": os.getenv("ENABLE_SIGNALS", "true").lower() == "true",
     }
 
 
@@ -323,6 +324,7 @@ class IntegratedBTCStrategy(Strategy):
         self.trade_window_end_pct = thresholds["trade_window_end_pct"]
         self.trend_up_threshold = thresholds["trend_up_threshold"]
         self.trend_down_threshold = thresholds["trend_down_threshold"]
+        self.enable_signals = thresholds["enable_signals"]
         
         self.bot_start_time = datetime.now(timezone.utc)
         self.restart_after_minutes = 90
@@ -1109,37 +1111,40 @@ class IntegratedBTCStrategy(Strategy):
             return
 
         logger.info(f"Current price: ${float(current_price):,.4f}")
+        fused = None
+        if self.enable_signals:
+            # --- Phase 4a: Build real metadata for processors ---
+            metadata = await self._fetch_market_context(current_price)
 
-        # --- Phase 4a: Build real metadata for processors ---
-        metadata = await self._fetch_market_context(current_price)
+            # --- Phase 4b: Run all signal processors ---
+            signals = self._process_signals(current_price, metadata)
 
-        # --- Phase 4b: Run all three signal processors ---
-        signals = self._process_signals(current_price, metadata)
+            if not signals:
+                logger.info("No signals generated — no trade this interval")
+                return
 
-        if not signals:
-            logger.info("No signals generated — no trade this interval")
-            return
+            logger.info(f"Generated {len(signals)} signal(s):")
+            for sig in signals:
+                logger.info(
+                    f"  [{sig.source}] {sig.direction.value}: "
+                    f"score={sig.score:.1f}, confidence={sig.confidence:.2%}"
+                )
 
-        logger.info(f"Generated {len(signals)} signal(s):")
-        for sig in signals:
+            # --- Phase 4c: Fuse signals into one consensus ---
+            # min_score lowered to 40 because the TREND FILTER (price at min 11-13)
+            # is now the primary decision maker. Fusion is informational context,
+            # not the trade gate. The trend gate below is the real filter.
+            fused = self.fusion_engine.fuse_signals(signals, min_signals=1, min_score=40.0)
+            if not fused:
+                logger.info("Fusion produced no actionable signal — no trade this interval")
+                return
+
             logger.info(
-                f"  [{sig.source}] {sig.direction.value}: "
-                f"score={sig.score:.1f}, confidence={sig.confidence:.2%}"
+                f"FUSED SIGNAL: {fused.direction.value} "
+                f"(score={fused.score:.1f}, confidence={fused.confidence:.2%})"
             )
-
-        # --- Phase 4c: Fuse signals into one consensus ---
-        # min_score lowered to 40 because the TREND FILTER (price at min 11-13)
-        # is now the primary decision maker. Fusion is informational context,
-        # not the trade gate. The trend gate below is the real filter.
-        fused = self.fusion_engine.fuse_signals(signals, min_signals=1, min_score=40.0)
-        if not fused:
-            logger.info("Fusion produced no actionable signal — no trade this interval")
-            return
-
-        logger.info(
-            f"FUSED SIGNAL: {fused.direction.value} "
-            f"(score={fused.score:.1f}, confidence={fused.confidence:.2%})"
-        )
+        else:
+            logger.info("Signals disabled — using trend-only mode")
 
         # --- Phase 5: Position size is always exactly $1.00 ---
         POSITION_SIZE_USD = Decimal("1.00")
@@ -1178,6 +1183,7 @@ class IntegratedBTCStrategy(Strategy):
                 f"⏭ TREND: NEUTRAL ({price_float:.2%}) — price in uncertain zone, SKIPPING trade "
                 f"(threshold zone: {self.trend_down_threshold:.0%}–{self.trend_up_threshold:.0%})"
             )
+            self.last_trade_time = -1  # Allow retry on the next quote tick in this window
             return
 
         # Risk engine: only check position-count / exposure limits (no sizing math)
