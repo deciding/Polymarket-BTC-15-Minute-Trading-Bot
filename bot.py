@@ -327,7 +327,7 @@ class IntegratedBTCStrategy(Strategy):
         self.enable_signals = thresholds["enable_signals"]
         
         self.bot_start_time = datetime.now(timezone.utc)
-        self.restart_after_minutes = 90
+        self.restart_after_minutes = float(os.getenv("RESTART_AFTER_MINUTES", "90"))
 
         # Nautilus
         self.instrument_id = None
@@ -450,6 +450,10 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("  Phase 6: Performance tracking ready")
         logger.info("  Phase 7: Learning engine ready")
         logger.info("  $1 per trade maximum")
+        if self.restart_after_minutes > 0:
+            logger.info(f"  Auto-restart after {self.restart_after_minutes:.0f} minutes")
+        else:
+            logger.info("  Auto-restart disabled")
         logger.info("=" * 80)
 
     # ------------------------------------------------------------------
@@ -815,7 +819,7 @@ class IntegratedBTCStrategy(Strategy):
         while True:
             # --- auto-restart check ---
             uptime_minutes = (datetime.now(timezone.utc) - self.bot_start_time).total_seconds() / 60
-            if uptime_minutes >= self.restart_after_minutes:
+            if self.restart_after_minutes > 0 and uptime_minutes >= self.restart_after_minutes:
                 logger.warning("AUTO-RESTART TIME - Loading fresh filters")
                 import signal as _signal
                 os.kill(os.getpid(), _signal.SIGTERM)
