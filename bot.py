@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -59,53 +60,132 @@ import redis
 
 
 
-def get_market_winner_sync(market_slug: str) -> str:
-    """Query Polymarket API to get the winning outcome using REST API."""
+def get_market_winner_sync(market_slug: str, last_price: float = None) -> str:
+    """Resolve a market winner from Gamma API market/event payloads."""
     import requests
-    try:
-        # Use REST API endpoint
-        response = requests.get(
-            f"https://clob.polymarket.com/markets/{market_slug}",
-            timeout=10
-        )
-        if response.status_code == 200:
-            data = response.json()
-            
-            # Check for resolution
-            resolution = data.get("resolution")
-            if resolution:
-                return resolution.upper()
-            
-            # Check outcome prices - winner has price = 1.0 or > 0.5
-            outcomes = data.get("outcomes", [])
-            if not outcomes:
-                # Try alternative field
-                outcome_prices = data.get("outcomePrices", "[]")
-                if outcome_prices:
-                    try:
-                        import json
-                        prices = json.loads(outcome_prices)
-                        if prices:
-                            # First outcome is YES (UP), second is NO (DOWN)
-                            if float(prices[0]) >= 0.5:
-                                return "YES"
-                            elif float(prices[1]) >= 0.5:
-                                return "NO"
-                    except:
-                        pass
-            
-            # Check tokens field
-            tokens = data.get("tokens", [])
+
+    def normalize_outcome(value: str) -> str:
+        outcome = value.strip().upper()
+        if outcome in {"YES", "UP"}:
+            return "UP"
+        if outcome in {"NO", "DOWN"}:
+            return "DOWN"
+        return outcome
+
+    def derive_winner(market: dict) -> str:
+        resolution = market.get("resolution")
+        if isinstance(resolution, str) and resolution.strip():
+            return normalize_outcome(resolution)
+
+        tokens = market.get("tokens")
+        if isinstance(tokens, list):
             for token in tokens:
-                if token.get("outcome") == "Yes" and float(token.get("price", 0)) >= 0.5:
-                    return "YES"
-                if token.get("outcome") == "No" and float(token.get("price", 0)) >= 0.5:
-                    return "NO"
-                    
+                if token.get("winner") is True:
+                    outcome = token.get("outcome")
+                    if isinstance(outcome, str) and outcome.strip():
+                        return normalize_outcome(outcome)
+
+        outcomes_raw = market.get("outcomes")
+        prices_raw = market.get("outcomePrices")
+        if isinstance(outcomes_raw, str) and isinstance(prices_raw, str):
+            try:
+                outcomes = json.loads(outcomes_raw)
+                prices = json.loads(prices_raw)
+                for outcome, price in zip(outcomes, prices):
+                    if float(price) >= 0.999:
+                        return normalize_outcome(str(outcome))
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pass
+
+        return "UNKNOWN"
+
+    def select_market_from_event(event: dict, slug: str) -> Optional[dict]:
+        markets = event.get("markets")
+        if not isinstance(markets, list):
+            return None
+        for market in markets:
+            if isinstance(market, dict) and market.get("slug") == slug:
+                return market
+        return markets[0] if markets and isinstance(markets[0], dict) else None
+
+    try:
+        market_response = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"slug": market_slug},
+            timeout=15,
+        )
+        market_response.raise_for_status()
+        markets = market_response.json()
+        if isinstance(markets, list) and markets:
+            market = markets[0]
+            logger.info(f"  Found market via gamma-api markets: closed={market.get('closed')}")
+            winner = derive_winner(market)
+            if winner != "UNKNOWN":
+                logger.info(f"  Winner source: market payload")
+                return winner
+
+        logger.info("  Market not resolved via /markets, trying /events fallback")
+        event_response = requests.get(
+            "https://gamma-api.polymarket.com/events",
+            params={"slug": market_slug},
+            timeout=15,
+        )
+        event_response.raise_for_status()
+        events = event_response.json()
+        if isinstance(events, list) and events:
+            event = events[0]
+            market = select_market_from_event(event, market_slug)
+            if market:
+                market.setdefault("resolutionSource", event.get("resolutionSource"))
+                market.setdefault("closed", event.get("closed"))
+                market.setdefault("active", event.get("active"))
+                market.setdefault("endDate", event.get("endDate"))
+                winner = derive_winner(market)
+                if winner != "UNKNOWN":
+                    logger.info("  Winner source: event markets outcomePrices/tokens")
+                    return winner
+
+        logger.info("  API did not yield a winner, trying last_price fallback")
+        if last_price is not None:
+            logger.info(f"  Using last known price: {last_price}")
+            if last_price >= 0.5:
+                return "UP"
+            return "DOWN"
+        
+        logger.warning(f"  Market not found and no last_price available")
         return "UNKNOWN"
     except Exception as e:
         logger.warning(f"Could not fetch market winner for {market_slug}: {e}")
+        
+        # Fallback: use last known price
+        if last_price is not None:
+            logger.info(f"  Using last known price as fallback: {last_price}")
+            if last_price >= 0.5:
+                return "UP"
+            return "DOWN"
+        
         return "UNKNOWN"
+
+
+async def _poll_market_resolution_for_slug(self, market_slug: str):
+    """Poll for market resolution async with retries"""
+    max_retries = 6
+    retry_delay = 10  # seconds
+    
+    logger.info(f"  Polling for resolution (max {max_retries} tries)...")
+    
+    for attempt in range(max_retries):
+        winner = get_market_winner_sync(market_slug)
+        if winner != "UNKNOWN":
+            logger.info(f"  Resolution found on attempt {attempt + 1}: {winner}")
+            return winner
+        
+        if attempt < max_retries - 1:
+            logger.info(f"  Attempt {attempt + 1} failed, retrying in {retry_delay}s...")
+            await asyncio.sleep(retry_delay)
+    
+    logger.warning(f"  Could not resolve after {max_retries} attempts")
+    return "UNKNOWN"
 
 
 # Import our phases
@@ -342,7 +422,14 @@ class IntegratedBTCStrategy(Strategy):
         self.down_shares: float = 0.0
         self.down_usd_spent: float = 0.0
         self.current_market_slug: str = ""
-        self.last_traded_direction: str = ""
+        
+        # Previous market info (for resolution check after switch)
+        self.last_market_slug: str = ""
+        self.last_up_shares: float = 0.0
+        self.last_up_usd: float = 0.0
+        self.last_down_shares: float = 0.0
+        self.last_down_usd: float = 0.0
+        self.last_market_price: float = None
 
         self.test_mode = test_mode
 
@@ -675,9 +762,16 @@ class IntegratedBTCStrategy(Strategy):
         self.last_trade_time = -1
         logger.info(f"  Trade timer reset — will trade on next tick")
         
-        # Close any open realtime paper positions - print with resolution
+        # Save last market info for resolution check after switch
         if self.up_shares > 0 or self.down_shares > 0:
-            self._close_realtime_position()
+            self.last_market_slug = self.current_market_slug
+            self.last_up_shares = self.up_shares
+            self.last_up_usd = self.up_usd_spent
+            self.last_down_shares = self.down_shares
+            self.last_down_usd = self.down_usd_spent
+            # Save last price for fallback resolution
+            self.last_market_price = float(self.price_history[-1]) if self.price_history else None
+            
             # Reset for next market
             self.up_shares = 0.0
             self.up_usd_spent = 0.0
@@ -685,7 +779,12 @@ class IntegratedBTCStrategy(Strategy):
             self.down_usd_spent = 0.0
             self.current_market_slug = ""
         
+        # Switch to new market first
         self.subscribe_quote_ticks(self.instrument_id)
+        
+        # After switch, poll for last market resolution and write to log
+        if self.last_market_slug:
+            self._poll_and_write_resolution()
         return True
 
     # ------------------------------------------------------------------
@@ -1240,32 +1339,46 @@ class IntegratedBTCStrategy(Strategy):
         # Also call original for compatibility
         #await self._record_paper_trade(signal, position_size, current_price, direction)
 
-    def _close_realtime_position(self):
-        """Close accumulated realtime positions - with resolution"""
-        if self.current_market_slug == "":
-            return
-        
+    def _close_realtime_position_sync(self, market_slug, up_shares, up_usd, down_shares, down_usd):
+        """Close accumulated realtime positions - sync with polling"""
         logger.info("=" * 80)
         logger.info("[REALTIME PAPER] MARKET CLOSED - FINAL POSITION")
-        logger.info(f"  Market: {self.current_market_slug}")
-        logger.info(f"  UP shares: {self.up_shares:.4f} | USD spent: ${self.up_usd_spent:.2f}")
-        logger.info(f"  DOWN shares: {self.down_shares:.4f} | USD spent: ${self.down_usd_spent:.2f}")
+        logger.info(f"  Market: {market_slug}")
+        logger.info(f"  UP shares: {up_shares:.4f} | USD spent: ${up_usd:.2f}")
+        logger.info(f"  DOWN shares: {down_shares:.4f} | USD spent: ${down_usd:.2f}")
         logger.info("")
         
-        total_spent = self.up_usd_spent + self.down_usd_spent
+        total_spent = up_usd + down_usd
         logger.info(f"  Total USD spent: ${total_spent:.2f}")
         
         # Determine which direction bet
-        if self.up_shares > self.down_shares:
+        if up_shares > down_shares:
             logger.info(f"  Direction bet: UP (more UP shares)")
-        elif self.down_shares > self.up_shares:
+        elif down_shares > up_shares:
             logger.info(f"  Direction bet: DOWN (more DOWN shares)")
         else:
             logger.info(f"  Direction bet: EQUAL")
         
-        # Query Polymarket for actual winner
-        winner = get_market_winner_sync(self.current_market_slug)
         logger.info("")
+        
+        # Poll for resolution synchronously (max 90 seconds)
+        max_retries = 9
+        retry_delay = 10
+        logger.info(f"  Polling for resolution (max {max_retries} tries)...")
+        
+        winner = "UNKNOWN"
+        for attempt in range(max_retries):
+            winner = get_market_winner_sync(market_slug)
+            if winner != "UNKNOWN":
+                logger.info(f"  Resolution found on attempt {attempt + 1}: {winner}")
+                break
+            if attempt < max_retries - 1:
+                logger.info(f"  Attempt {attempt + 1} failed, retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+        
+        if winner == "UNKNOWN":
+            logger.warning(f"  Could not resolve after {max_retries} attempts")
+        
         logger.info(f"  Market winner: {winner}")
         
         if winner == "YES":
@@ -1273,24 +1386,79 @@ class IntegratedBTCStrategy(Strategy):
         elif winner == "NO":
             logger.info(f"  Actual outcome: DOWN WON")
         else:
-            logger.info(f"  Actual outcome: {winner} (not resolved yet)")
+            logger.info(f"  Actual outcome: {winner}")
         
         logger.info("=" * 80)
         
         # Write to close_market.log with flush
+        logger.info(f"  Writing to close_market.log (winner={winner})...")
         try:
             with open('close_market.log', 'a') as f:
-                f.write(f"[{datetime.now(timezone.utc).isoformat()}] Market: {self.current_market_slug}\n")
-                f.write(f"  UP: {self.up_shares:.4f} shares | ${self.up_usd_spent:.2f}\n")
-                f.write(f"  DOWN: {self.down_shares:.4f} shares | ${self.down_usd_spent:.2f}\n")
+                f.write(f"[{datetime.now(timezone.utc).isoformat()}] Market: {market_slug}\n")
+                f.write(f"  UP: {up_shares:.4f} shares | ${up_usd:.2f}\n")
+                f.write(f"  DOWN: {down_shares:.4f} shares | ${down_usd:.2f}\n")
                 f.write(f"  Winner: {winner}\n")
                 f.write("\n")
                 f.flush()
+            logger.info("  Log written successfully")
         except Exception as e:
             logger.warning(f"Failed to write close_market.log: {e}")
         
         # Clear current position
         self.current_realtime_position = None
+
+    def _poll_and_write_resolution(self):
+        """Poll for previous market resolution and write to log"""
+        market_slug = self.last_market_slug
+        up_shares = self.last_up_shares
+        up_usd = self.last_up_usd
+        down_shares = self.last_down_shares
+        down_usd = self.last_down_usd
+        
+        logger.info("=" * 80)
+        logger.info("[REALTIME PAPER] CHECKING PREVIOUS MARKET RESOLUTION")
+        logger.info(f"  Market: {market_slug}")
+        logger.info(f"  UP: {up_shares:.4f} shares | ${up_usd:.2f}")
+        logger.info(f"  DOWN: {down_shares:.4f} shares | ${down_usd:.2f}")
+        
+        # Poll for resolution
+        max_retries = 9
+        retry_delay = 10
+        logger.info(f"  Polling for resolution (max {max_retries} tries)...")
+        logger.info(f"  Last known price: {self.last_market_price}")
+        
+        winner = "UNKNOWN"
+        for attempt in range(max_retries):
+            winner = get_market_winner_sync(market_slug, self.last_market_price)
+            if winner != "UNKNOWN":
+                logger.info(f"  Resolution found on attempt {attempt + 1}: {winner}")
+                break
+            if attempt < max_retries - 1:
+                logger.info(f"  Attempt {attempt + 1} failed, retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+        
+        if winner == "UNKNOWN":
+            logger.warning(f"  Could not resolve after {max_retries} attempts")
+        
+        logger.info(f"  Market winner: {winner}")
+        logger.info("=" * 80)
+        
+        # Write to log
+        logger.info(f"  Writing to close_market.log...")
+        try:
+            with open('close_market.log', 'a') as f:
+                f.write(f"[{datetime.now(timezone.utc).isoformat()}] Market: {market_slug}\n")
+                f.write(f"  UP: {up_shares:.4f} shares | ${up_usd:.2f}\n")
+                f.write(f"  DOWN: {down_shares:.4f} shares | ${down_usd:.2f}\n")
+                f.write(f"  Winner: {winner}\n")
+                f.write("\n")
+                f.flush()
+            logger.info("  Log written successfully")
+        except Exception as e:
+            logger.warning(f"Failed to write close_market.log: {e}")
+        
+        # Clear last market info
+        self.last_market_slug = ""
 
     def _save_paper_trades(self):
         import json
