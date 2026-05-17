@@ -1129,10 +1129,12 @@ class IntegratedBTCStrategy(Strategy):
     async def _realtime_paper_trade(self, signal, position_size, current_price, direction):
         """Record real-time paper trade with accumulated UP/DOWN shares"""
         price_float = float(current_price)
-        usd_spent = float(position_size)
+        #usd_spent = float(position_size)
+        usd_spent = price_float
         
         # Calculate actual shares bought: shares = USD / price
-        shares = usd_spent / price_float
+        #shares = usd_spent / price_float
+        shares = 1.0
         
         # Determine market info
         if self.current_instrument_index >= 0 and self.current_instrument_index < len(self.all_btc_instruments):
@@ -1161,7 +1163,7 @@ class IntegratedBTCStrategy(Strategy):
         else:
             # Bought DOWN (NO)
             self.down_shares += shares
-            self.down_usd_spent += usd_spent
+            self.down_usd_spent += (1 - usd_spent)
             side_label = "DOWN (NO)"
         
         # Print immediate entry log
@@ -1180,7 +1182,7 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
         
         # Also call original for compatibility
-        await self._record_paper_trade(signal, position_size, current_price, direction)
+        #await self._record_paper_trade(signal, position_size, current_price, direction)
 
     def _close_realtime_position(self):
         """Close accumulated realtime positions - just print shares and spent"""
@@ -1269,8 +1271,9 @@ class IntegratedBTCStrategy(Strategy):
 
             # Always BUY — the market-order patch converts this to a USD amount.
             # Pass dummy qty=5 (minimum) so Nautilus risk engine doesn't deny it.
-            min_qty_val = float(getattr(instrument, 'min_quantity', None) or 5.0)
-            token_qty = max(min_qty_val, 5.0)
+            MIN_QTY = 1.0
+            min_qty_val = float(getattr(instrument, 'min_quantity', None) or MIN_QTY)
+            token_qty = max(min_qty_val, MIN_QTY)
             token_qty = round(token_qty, precision)
             logger.info(
                 f"BUY {trade_label}: dummy qty={token_qty:.6f} "
