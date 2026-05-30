@@ -1822,7 +1822,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     logger.info(f"  First: {btc_slugs[0]}  Last: {btc_slugs[-1]}")
     logger.info("=" * 80)
 
-    _, poly_data_cfg, poly_exec_cfg = build_polymarket_client_configs(btc_slugs, signature_type=0)
+    _, poly_data_cfg, poly_exec_cfg = build_polymarket_client_configs(btc_slugs, signature_type=3)
 
     config = TradingNodeConfig(
         environment="live",

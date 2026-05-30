@@ -32,12 +32,13 @@ def apply_market_order_patch():
         return True
 
     try:
+        from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_NAUTILUS_BUILDER_CODE
         from nautilus_trader.adapters.polymarket.execution import PolymarketExecutionClient
         from nautilus_trader.adapters.polymarket.common.symbol import get_polymarket_token_id
         from nautilus_trader.adapters.polymarket.http.conversion import convert_tif_to_polymarket_order_type
         from nautilus_trader.model.enums import OrderSide, order_side_to_str
         from nautilus_trader.common.enums import LogColor
-        from py_clob_client.client import MarketOrderArgs, PartialCreateOrderOptions
+        from py_clob_client_v2.client import MarketOrderArgsV2, PartialCreateOrderOptions
 
         # --- Read USD amount from environment (default $1) ---
         _DEFAULT_USD_AMOUNT = float(os.getenv("MARKET_BUY_USD", "1.0"))
@@ -63,12 +64,15 @@ def apply_market_order_patch():
                 )
 
                 order_type = convert_tif_to_polymarket_order_type(order.time_in_force)
+                user_usdc_balance = await self._get_collateral_balance_pusd()
 
-                market_order_args = MarketOrderArgs(
+                market_order_args = MarketOrderArgsV2(
                     token_id=get_polymarket_token_id(order.instrument_id),
                     amount=usd_amount,          # ← USD, not tokens
                     side=order_side_to_str(order.side),
                     order_type=order_type,
+                    user_usdc_balance=user_usdc_balance,
+                    builder_code=POLYMARKET_NAUTILUS_BUILDER_CODE,
                 )
 
                 neg_risk = self._get_neg_risk_for_instrument(instrument)
@@ -108,11 +112,12 @@ def apply_market_order_patch():
                 amount = float(order.quantity)
                 order_type = convert_tif_to_polymarket_order_type(order.time_in_force)
 
-                market_order_args = MarketOrderArgs(
+                market_order_args = MarketOrderArgsV2(
                     token_id=get_polymarket_token_id(order.instrument_id),
                     amount=amount,
                     side=order_side_to_str(order.side),
                     order_type=order_type,
+                    builder_code=POLYMARKET_NAUTILUS_BUILDER_CODE,
                 )
 
                 neg_risk = self._get_neg_risk_for_instrument(instrument)
