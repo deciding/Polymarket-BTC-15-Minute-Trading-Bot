@@ -43,8 +43,12 @@ def apply_clob_auth_patch() -> bool:
             )
 
             # Deposit-wallet flow: L2 POLY_ADDRESS must match the deposit wallet.
+            # Only override for order endpoints — balance/allowance endpoints
+            # still need the EOA address for API-key auth.
             if int(self.builder.signature_type) == 3 and self.builder.funder:
-                headers["POLY_ADDRESS"] = self.builder.funder
+                endpoint_lower = (endpoint or "").lower()
+                if "order" in endpoint_lower:
+                    headers["POLY_ADDRESS"] = self.builder.funder
 
             return headers
 

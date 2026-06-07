@@ -189,10 +189,12 @@ class WebSocketPriceFeed:
         up_token_id: str,
         down_token_id: str,
         on_quote,
+        sample_interval: float | None = 3.0,
     ):
         self._up_token_id = up_token_id
         self._down_token_id = down_token_id
         self._on_quote = on_quote
+        self._sample_interval = sample_interval
         self._up: dict | None = None
         self._down: dict | None = None
         self._last_merged_ms: int = 0
@@ -226,21 +228,43 @@ class WebSocketPriceFeed:
 
     def _handle(self, raw: str):
         msg = json.loads(raw)
-        if msg.get("type") != "best_bid_ask":
+
+        if isinstance(msg, list):
+            self._handle_initial_dump(msg)
             return
 
-        asset_id = msg["asset_id"]
-        ts_ms = int(msg["timestamp"])
-        bid = float(msg["bid"])
-        ask = float(msg["ask"])
+        if isinstance(msg, dict) and msg.get("event_type") == "price_change":
+            ts_ms = int(msg["timestamp"])
+            for change in msg.get("price_changes", []):
+                aid = change["asset_id"]
+                bb = change.get("best_bid")
+                ba = change.get("best_ask")
+                if bb is not None and ba is not None:
+                    self._update_price(aid, ts_ms, float(bb), float(ba))
+            self._emit_if_ready()
+            return
 
+    def _handle_initial_dump(self, books: list):
+        ts_ms = 0
+        for book in books:
+            aid = book.get("asset_id")
+            ts_ms = max(ts_ms, int(book.get("timestamp", 0)))
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            best_bid = float(bids[0]["price"]) if bids else None
+            best_ask = float(asks[0]["price"]) if asks else None
+            if best_bid is not None and best_ask is not None:
+                self._update_price(aid, ts_ms, best_bid, best_ask)
+        self._emit_if_ready()
+
+    def _update_price(self, asset_id: str, ts_ms: int, bid: float, ask: float):
+        entry = {"ts": ts_ms, "bid": bid, "ask": ask}
         if asset_id == self._up_token_id:
-            self._up = {"ts": ts_ms, "bid": bid, "ask": ask}
+            self._up = entry
         elif asset_id == self._down_token_id:
-            self._down = {"ts": ts_ms, "bid": bid, "ask": ask}
-        else:
-            return
+            self._down = entry
 
+    def _emit_if_ready(self):
         if self._up is None or self._down is None:
             return
 
@@ -248,15 +272,16 @@ class WebSocketPriceFeed:
         if merged_ts <= self._last_merged_ms:
             return
 
-        now_ts = time.time()
-        if not (
-            self._last_sample_ts is None
-            or (now_ts - self._last_sample_ts) >= 3.0
-        ):
-            return
+        if self._sample_interval is not None:
+            now_ts = time.time()
+            if (
+                self._last_sample_ts is not None
+                and (now_ts - self._last_sample_ts) < self._sample_interval
+            ):
+                return
+            self._last_sample_ts = now_ts
 
         self._last_merged_ms = merged_ts
-        self._last_sample_ts = now_ts
 
         ts_iso = datetime.fromtimestamp(
             merged_ts / 1000, tz=timezone.utc
@@ -386,8 +411,112 @@ async def run_bot():
             await asyncio.sleep(wait)
 
 
+def run_balance_check():
+    from eth_account import Account as EthAccount
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    load_dotenv()
+
+    pk = os.environ["POLYMARKET_PK"]
+    raw = pk if pk.startswith("0x") else "0x" + pk
+    eoa = EthAccount.from_key(raw).address
+    print(f"EOA (signer):       {eoa}")
+
+    wallet, deployed = check_deposit()
+    print(f"Deposit wallet:     {wallet}")
+    print(f"Deployed:           {deployed}")
+
+    funder = wallet if deployed else os.environ.get("POLYMARKET_FUNDER", wallet)
+    print(f"Funder (orders):    {funder}")
+
+    print(f"POLY_ADDRESS for balance calls:  {eoa}   (patch skips non-order endpoints)")
+    print(f"POLY_ADDRESS for order calls:    {funder} (patch overrides when endpoint contains 'order')")
+
+    usdc = check_balance(funder)
+    print(f"USDC balance:       ${usdc:.2f}")
+
+
+async def run_ticks():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    load_dotenv()
+
+    interval = int(os.getenv("MARKET_INTERVAL_SECONDS", "300"))
+
+    while True:
+        now = datetime.now(timezone.utc)
+        slug = get_current_btc_market_slug(now, interval)
+        market_data = fetch_gamma_market(slug)
+
+        if market_data is None:
+            logger.info("Market %s not available yet, retrying in 10s…", slug)
+            await asyncio.sleep(10)
+            continue
+
+        token_ids = json.loads(market_data["clobTokenIds"])
+        up_token_id = token_ids[0]
+        down_token_id = token_ids[1]
+        logger.info(
+            "Connected — slug=%s UP=%s… DOWN=%s…",
+            slug, up_token_id[:12], down_token_id[:12],
+        )
+
+        feed = WebSocketPriceFeed(
+            up_token_id,
+            down_token_id,
+            sample_interval=None,
+            on_quote=lambda q: print(
+                f"{q['ts']}  "
+                f"UP bid={q['up_bid']:.4f} ask={q['up_ask']:.4f}  "
+                f"DOWN bid={q['down_bid']:.4f} ask={q['down_ask']:.4f}  "
+                f"mid={((q['up_bid']+q['up_ask'])/2):.4f}"
+            ),
+        )
+
+        feed_task = asyncio.create_task(feed.run())
+        try:
+            await asyncio.sleep(interval)
+        finally:
+            feed.stop()
+            feed_task.cancel()
+            try:
+                await feed_task
+            except asyncio.CancelledError:
+                pass
+
+        now_ts = time.time()
+        next_boundary = ((now_ts // interval) + 1) * interval
+        wait = next_boundary - now_ts
+        logger.info("Market ended, next in %.1fs…", wait)
+        await asyncio.sleep(max(wait, 1))
+
+
 def main():
-    asyncio.run(run_bot())
+    import argparse
+    parser = argparse.ArgumentParser(description="Polymarket BTC 5-min trading bot (V2)")
+    parser.add_argument(
+        "--check-balance", "-b",
+        action="store_true",
+        help="Only check deposit wallet + CLOB balance, then exit",
+    )
+    parser.add_argument(
+        "--ticks", "-t",
+        action="store_true",
+        help="Print live UP/DOWN price ticks for the current 5-min market",
+    )
+    args = parser.parse_args()
+
+    if args.check_balance:
+        run_balance_check()
+    elif args.ticks:
+        asyncio.run(run_ticks())
+    else:
+        asyncio.run(run_bot())
 
 
 if __name__ == "__main__":
