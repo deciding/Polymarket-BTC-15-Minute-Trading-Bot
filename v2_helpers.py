@@ -187,6 +187,59 @@ def build_trade_decision(
     }
 
 
+def build_trade_decision_dual(
+    market: dict[str, Any],
+    start_pct: float,
+    end_pct: float,
+    up_threshold: float,
+    down_threshold: float,
+    interval_seconds: int = 300,
+) -> dict[str, Any]:
+    _validate_interval_seconds(interval_seconds)
+    start_time = _parse_ts(str(market["market_start_time"]))
+    window_start = start_pct * interval_seconds
+    window_end = end_pct * interval_seconds
+
+    for quote in market.get("quotes", []):
+        elapsed = (_parse_ts(str(quote["ts"])) - start_time).total_seconds()
+        if not (window_start <= elapsed < window_end):
+            continue
+
+        up_ask = float(quote["up_ask"])
+        down_ask = float(quote["down_ask"])
+
+        if up_ask > up_threshold:
+            payout = 1.0 if market.get("winner") == "UP" else 0.0
+            return {
+                "traded": True,
+                "side": "UP",
+                "entry_price": up_ask,
+                "spent": up_ask,
+                "payout": payout,
+                "profit": payout - up_ask,
+            }
+
+        if down_ask > up_threshold:
+            payout = 1.0 if market.get("winner") == "DOWN" else 0.0
+            return {
+                "traded": True,
+                "side": "DOWN",
+                "entry_price": down_ask,
+                "spent": down_ask,
+                "payout": payout,
+                "profit": payout - down_ask,
+            }
+
+    return {
+        "traded": False,
+        "side": None,
+        "entry_price": None,
+        "spent": 0.0,
+        "payout": 0.0,
+        "profit": 0.0,
+    }
+
+
 def evaluate_market_trade(
     market: dict[str, Any],
     start_pct: float,
